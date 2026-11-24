@@ -1,0 +1,111 @@
+import AppKit
+import CryptoKit
+
+/// Renders into a flipped bitmap with a nonzero chart origin. No window,
+/// display hardware, application preferences or player save is required.
+private final class Surface {
+    let chart = HarborChart()
+    let bounds = CGRect(x: 9, y: 7, width: 790, height: 425)
+    let context: CGContext
+
+    init() {
+        context = CGContext(data: nil, width: 808, height: 439, bitsPerComponent: 8,
+                            bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.translateBy(x: 0, y: 439)
+        context.scaleBy(x: 1, y: -1)
+    }
+
+    func render(_ game: MistVoyage, options: ChartOptions, time: TimeInterval = 0) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        chart.draw(in: bounds, game: game, time: time, options: options)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    func digest(in crop: CGRect? = nil) -> SHA256.Digest {
+        var image = context.makeImage()!
+        if let crop {
+            image = image.cropping(to: crop.integral)!
+            // A cropped image's provider can reference its parent's full data.
+            let small = CGContext(data: nil, width: image.width, height: image.height,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            small.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            image = small.makeImage()!
+        }
+        return SHA256.hash(data: image.dataProvider!.data! as Data)
+    }
+}
+
+@main
+struct RenderChecks {
+    static func require(_ passed: Bool, _ reason: String) {
+        if !passed {
+            fputs("FAIL \(reason)\n", stderr)
+            exit(1)
+        }
+    }
+
+    static func survey(_ rows: [String]) -> MistVoyage {
+        let level = MistLevel(id: 0, title: "测试", district: "外海", sender: "", recipient: "",
+                              postmark: "", letter: "", briefing: "", rows: rows,
+                              echoLimit: 0, turnLimit: 12, routes: [])
+        return MistVoyage(level: level)
+    }
+
+    static func main() {
+        let surface = Surface()
+        var options = ChartOptions()
+        options.reduceMotion = true
+        for level in MistCampaign.levels {
+            let game = MistVoyage(level: level)
+            for y in 0..<level.height {
+                for x in 0..<level.width {
+                    let point = MistPoint(x: x, y: y)
+                    let center = surface.chart.center(of: point, in: surface.bounds, game: game)
+                    require(surface.chart.cell(at: center, in: surface.bounds, game: game) == point,
+                            "hit test in route \(level.id), tile \(point)")
+                }
+            }
+        }
+        let level = MistLevel(id: 91, title: "闸臂", district: "试航", sender: "", recipient: "",
+                              postmark: "", letter: "", briefing: "", rows: ["..a....","S...A.H","#######"],
+                              echoLimit: 1, turnLimit: 12, routes: ["EEN","EEEEEE"])
+        guard let game = MistVoyage(level: level, replay: Array(level.guide.prefix(6))) else {
+            require(false, "could not load the first echo crossing")
+            return
+        }
+        require(game.beat == 2 && !game.gateOpen(0, at: 2) && game.gateOpen(0, at: 3),
+                "crossing fixture no longer represents a changing lock")
+        let center = surface.chart.center(of: MistPoint(x: 4, y: 1), in: surface.bounds, game: game)
+        require(surface.chart.cell(at: CGPoint(x: CGFloat.greatestFiniteMagnitude, y: 0),
+                                   in: surface.bounds, game: game) == nil,
+                "off-chart coordinates must be rejected before integer conversion")
+        let slot = CGRect(x: center.x-25, y: center.y-23, width: 50, height: 46)
+        surface.render(game, options: options)
+        let live = surface.digest(in: slot)
+        let settled = surface.digest()
+        surface.render(game, options: options, time: 19.72)
+        require(settled == surface.digest(), "reduced-motion frame changed with time")
+        options.previewBeat = 2
+        surface.render(game, options: options)
+        let shut = surface.digest(in: slot)
+        options.previewBeat = 3
+        surface.render(game, options: options)
+        require(live == surface.digest(in: slot) && live != shut,
+                "live lock must show arrival-beat passability while inspection shows the selected beat")
+
+        options.previewBeat = nil
+        let a = survey(["..#..", "S...H", "###.."])
+        let b = survey([".##..", "S...H", "..#.."])
+        surface.render(a, options: options)
+        let first = surface.digest()
+        surface.render(b, options: options)
+        require(first != surface.digest(), "different same-ID route reused its predecessor's terrain")
+        surface.render(a, options: options)
+        require(first == surface.digest(), "returning to a route changed its artwork")
+        print("PASS chart hit testing, arrival and inspected gate graphics, reduced motion and terrain cache isolation.")
+    }
+}

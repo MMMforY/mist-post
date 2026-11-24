@@ -1,0 +1,216 @@
+import Foundation
+
+var checks = 0
+var failures = 0
+
+func expect(_ result: Bool, _ label: String) {
+    checks += 1
+    if !result {
+        failures += 1
+        if failures <= 25 { print("FAIL \(label)") }
+    }
+}
+
+func identical(_ lhs: MistVoyage, _ rhs: MistVoyage) -> Bool {
+    lhs.level.id == rhs.level.id && lhs.path == rhs.path && lhs.echoes == rhs.echoes
+        && lhs.history == rhs.history && lhs.stamped == rhs.stamped
+}
+
+func checkHints(from start: MistVoyage, report: String) {
+    var game = start
+    let cap = 3 * (game.level.echoLimit + 1) * (game.level.turnLimit + 1)
+    for _ in 0..<cap {
+        if game.delivered { return }
+        let hint = game.hint()
+        if let command = hint.command {
+            if case .blocked(let why) = game.perform(command) {
+                expect(false, "\(report) hint proposed blocked action \(why)")
+                return
+            }
+        } else {
+            // The app shows the exact number of undo operations in its recovery message.
+            let amount = hint.undoCount
+            guard amount > 0, hint.text.contains("撤回 \(amount) 次") else {
+                expect(false, "\(report) invalid recovery advice")
+                return
+            }
+            for _ in 0..<amount { _ = game.undo() }
+        }
+    }
+    expect(false, "\(report) hint navigation did not terminate from \(start.history)")
+}
+
+var rng = GameRandom(seed: 0x534541)
+let campaign = MistCampaign.levels
+expect(campaign.map(\.id) == Array(1...12), "stable route ids")
+expect(Set(campaign.map(\.title)).count == campaign.count, "unique titles")
+expect(Set(campaign.map(\.postmark)).count == campaign.count, "unique collectible postmarks")
+
+for level in campaign {
+    let label = "\(level.id) \(level.title)"
+    let initial = MistVoyage(level: level)
+    var game = initial
+    var gates: [MistPoint] = []
+    var buoys: [MistPoint] = []
+    for y in 0..<level.height {
+        for x in 0..<level.width {
+            let point = MistPoint(x: x, y: y)
+            switch level.tile(at: point) {
+            case .gate: gates.append(point)
+            case .buoy: buoys.append(point)
+            default: break
+            }
+        }
+    }
+    var snapshots = [game]
+    for (index, command) in level.guide.enumerated() {
+        let outcome = game.perform(command)
+        if case .blocked(let reason) = outcome {
+            expect(false, "\(label) guide command \(index + 1) blocked by \(reason)")
+            break
+        }
+        if command == .record {
+            expect(game.beat == 0 && game.stamped.isEmpty && game.position == level.origin, "\(label) clean next tide")
+            expect(game.echoPositions(at: Int.min).allSatisfy { $0 == level.origin }, "\(label) echo origin")
+            expect(game.echoPositions(at: Int.max) == game.echoes.compactMap(\.last), "\(label) echo hold")
+        }
+        let before = snapshots.last!
+        var undone = game
+        expect(undone.undo() && identical(undone, before), "\(label) reverse \(index + 1)")
+        let reloaded = MistVoyage(level: level, replay: game.history)
+        expect(reloaded.map { identical($0, game) } == true, "\(label) resume \(index + 1)")
+        snapshots.append(game)
+    }
+    expect(game.delivered && game.totalBeats == level.par, "\(label) verified score")
+    expect(game.echoes.count == level.echoLimit, "\(label) planned recording count")
+    expect(game.stamped == level.stamps, "\(label) all postmarks collected")
+    expect(MistVoyage(level: level, replay: game.history + [.move(.wait)]) == nil, "\(label) reject post-delivery save")
+    let data = try! JSONEncoder().encode(game.history)
+    expect(try! JSONDecoder().decode([MistCommand].self, from: data) == game.history, "\(label) JSON replay round trip")
+    for snapshot in snapshots.reversed() {
+        expect(identical(snapshot, game), "\(label) undo sequence")
+        _ = game.undo()
+    }
+    expect(!game.canUndo && !game.undo(), "\(label) history domain")
+
+    game = snapshots[snapshots.count / 2]
+    game.restart()
+    expect(identical(game, initial), "\(label) restart any phase")
+    expect(initial.routeToDelivery() != nil ? level.echoLimit == 0 : level.echoLimit > 0, "\(label) no echo shortcut")
+    if level.echoLimit > 0 {
+        let one = oneEchoDelivery(level)
+        expect((one != nil) == (level.echoLimit == 1), "\(label) necessary and sufficient echo count")
+    }
+
+    // Each physical gate must protect a delivery landmark or another required buoy.
+    for gate in gates {
+        let reachable = connected(level, closing: [gate])
+        let targets = level.stamps.union([level.harbor]).union(buoys)
+        expect(!targets.isSubset(of: reachable), "\(label) gate at \(gate) admits a bypass")
+    }
+    checkHints(from: initial, report: label)
+
+    // Check divergent live play, including rejected moves, early commitments,
+    // expired tides and undo immediately after recording. Recover every sample.
+    for sample in 0..<48 {
+        game = snapshots[rng.choose(snapshots.count)]
+        for _ in 0..<(4 + rng.choose(16)) {
+            let previous = game
+            let action = rng.choose(8)
+            if action == 0 { _ = game.undo(); continue }
+            let result: MistOutcome = action == 1 ? game.record() : game.step(MistMove.allCases[rng.choose(5)])
+            if case .blocked = result {
+                expect(identical(previous, game), "\(label) rejected action atomicity")
+            }
+            expect(MistVoyage(level: level, replay: game.history).map { identical(game, $0) } == true,
+                   "\(label) random save \(sample)")
+        }
+        checkHints(from: game, report: "\(label)/\(sample)")
+    }
+    print("✓ \(label) · \(level.par) beats · \(level.echoLimit) echo(es) · \(gates.count) essential gate(s)")
+}
+
+var detour = MistVoyage(level: campaign[1])
+for move in [MistMove.east, .east, .east, .north] { _ = detour.step(move) }
+expect(detour.hint().command == .move(.west), "rejoin an echo from an alternate approach without undo")
+
+let bridge = campaign[3]
+expect(oneEchoDelivery(bridge, allowLiveWait: false) == nil, "route 4 requires waiting by the live boat")
+
+// Relax every gate linked to a chosen set of stationary signals to remain open
+// permanently. If this still fails, at least one echo must ring multiple bells.
+for id in [6, 9, 10, 11, 12] {
+    let level = campaign[id - 1]
+    var gates: [(MistPoint, Int)] = []
+    var ids: Set<Int> = []
+    for y in 0..<level.height {
+        for x in 0..<level.width {
+            let point = MistPoint(x: x, y: y)
+            if case .gate(let signal) = level.tile(at: point) {
+                gates.append((point, signal))
+                ids.insert(signal)
+            }
+        }
+    }
+    let signals = ids.sorted()
+    for mask in 0..<(1 << signals.count) where mask.nonzeroBitCount <= level.echoLimit {
+        let opened = Set(signals.enumerated().filter { mask & (1 << $0.offset) != 0 }.map(\.element))
+        let closed = Set(gates.filter { !opened.contains($0.1) }.map { $0.0 })
+        let reachable = connected(level, closing: closed)
+        expect(!level.stamps.union([level.harbor]).isSubset(of: reachable),
+               "route \(id) requires moving echoes, frozen signals \(opened)")
+    }
+}
+
+let chartOption = CommandLine.arguments.firstIndex(of: "--charts").flatMap { i in
+    CommandLine.arguments.indices.contains(i + 1) ? Int(CommandLine.arguments[i + 1]) : nil
+}
+checkGoldenCharts()
+checkChallenges(count: max(1, chartOption ?? 64))
+
+if CommandLine.arguments.contains("--optimal") {
+    let fixtures = [
+        (MistLevel(id: 90, title: "One echo fixture", district: "", sender: "", recipient: "", postmark: "",
+                   letter: "", briefing: "", rows: ["Sa###", "..A.H"], echoLimit: 1, turnLimit: 10,
+                   routes: ["E.", "S.EEEE"]), 6),
+        (MistLevel(id: 91, title: "Two echoes fixture", district: "", sender: "", recipient: "", postmark: "",
+                   letter: "", briefing: "", rows: ["#b###", "aSABH", "#####"], echoLimit: 2, turnLimit: 8,
+                   routes: ["W..", "N.", "..EEE"]), 5)
+    ]
+    for (level, expected) in fixtures {
+        expect(MistVoyage(level: level, replay: level.guide)?.delivered == true, "valid optimization fixture")
+        let optimum = auditOptimal(level)
+        expect(optimum.score == expected, "known optimum of \(level.title)")
+        var solved = MistVoyage(level: level)
+        for (index, route) in (optimum.routes ?? []).enumerated() {
+            if index > 0 { _ = solved.record() }
+            for move in route { _ = solved.step(move) }
+        }
+        expect(solved.delivered && solved.totalBeats == expected, "replay optimal witness of \(level.title)")
+    }
+    let selected: [Int] = []
+    for level in campaign where selected.isEmpty || selected.contains(level.id) {
+        let result = auditOptimal(level)
+        print("SCORE \(level.id) par \(level.par) optimal \(result.score) states \(result.explored)")
+        expect(result.score == level.par, "route \(level.id) published par is optimal")
+        if let routes = result.routes {
+            let letters: [MistMove: String] = [.north: "N", .east: "E", .south: "S", .west: "W", .wait: "."]
+            print("      " + routes.map { $0.compactMap { letters[$0] }.joined() }.joined(separator: " | "))
+        }
+    }
+}
+
+if CommandLine.arguments.contains("--vectors") {
+    for seed in 0..<8 {
+        let chart = MistChallenge.make(seed: UInt64(seed))
+        print("VECTOR \(seed) \(chart.code) \(String(versionFingerprint(chart.level), radix: 16))")
+    }
+}
+if let long = CommandLine.arguments.firstIndex(of: "--long-charts") {
+    let next = long + 1
+    let count = CommandLine.arguments.indices.contains(next) ? Int(CommandLine.arguments[next]) : nil
+    checkLongCharts(total: min(1 << 30, max(1, count ?? 32768)))
+}
+
+print("\(checks) checks, \(failures) failures")
+exit(failures == 0 ? 0 : 1)

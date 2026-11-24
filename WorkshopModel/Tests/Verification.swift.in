@@ -1,0 +1,304 @@
+import Foundation
+
+var checks = 0
+var failures = 0
+func expect(_ condition: Bool, _ message: String) {
+    checks += 1
+    if !condition {
+        failures += 1
+        if failures <= 15 { print("FAIL \(message)") }
+    }
+}
+
+func rejects(_ name: String, _ action: () throws -> Void) {
+    do {
+        try action()
+        expect(false, "\(name) accepted")
+    } catch let failure as MistWorkshopError {
+        expect(failure.errorDescription?.isEmpty == false, "\(name) returns localized model error")
+    } catch {
+        expect(false, "\(name) exposed raw error \(error)")
+    }
+}
+
+func point(_ x: Int, _ y: Int) -> MistPoint { MistPoint(x: x, y: y) }
+
+func decodeObject(_ data: Data) throws -> [String: Any] {
+    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw MistWorkshopError.malformed
+    }
+    return json
+}
+
+func encoded(_ object: [String: Any]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+}
+
+func verifyDraft(_ draft: MistWorkshopDraft) throws {
+    let trial = draft.trialLevel()
+    expect(trial.id == -1 && trial.guide.isEmpty, "unsolved draft only")
+    expect(trial.width == draft.size.width && trial.height == draft.size.height, "editable dimensions")
+    let content = draft.rows.joined()
+    expect(content.filter { $0 == "S" }.count == 1 && content.filter { $0 == "H" }.count == 1,
+           "ports remain unique")
+    expect(trial.tile(at: trial.origin) == .origin && trial.tile(at: trial.harbor) == .harbor,
+           "trial ports agree with map")
+    expect(trial.stamps.count <= 2 && (0...2).contains(trial.echoLimit) && (5...48).contains(trial.turnLimit),
+           "bounded trial rules")
+    let copy = try MistWorkshopDraft.restoreDraft(draft.encodedDraft())
+    expect(copy.board == draft.board && copy.undoBoards == draft.undoBoards, "autosave restores draft and history")
+}
+
+func fileCases() throws {
+    for size in MistWorkshopSize.allCases {
+        var game = MistWorkshopDraft(size: size)
+        try verifyDraft(game)
+        let start = game.trialLevel().origin
+        let end = game.trialLevel().harbor
+        let baseline = game.board
+        expect(!game.canUndo, "new document clean")
+        rejects("paint over port") { _ = try game.paint(.land, at: start) }
+        expect(!game.canUndo && game.board == baseline, "refused brush is atomic")
+        expect(try !game.paint(.origin, at: start), "same brush ignored")
+        expect(try game.paint(.origin, at: end), "swap ports")
+        expect(game.tile(at: end) == .origin && game.tile(at: start) == .harbor, "swap preserved both ports")
+        expect(game.undo() && game.board == baseline && !game.canUndo, "swap is a single edit")
+        expect(try game.paint(.stamp, at: point(1, 0)) && game.paint(.stamp, at: point(2, 0)), "paint two stamps")
+        let withTwo = try game.encodedDraft()
+        rejects("third stamp") { _ = try game.paint(.stamp, at: point(3, 0)) }
+        expect(try game.encodedDraft() == withTwo, "third stamp left history intact")
+        expect(try game.paint(.harbor, at: point(1, 0)), "move port onto stamp")
+        expect(game.trialLevel().stamps.count == 1 && game.tile(at: end) == .water, "move frees old berth")
+        rejects("invalid circuit") { _ = try game.paint(.gate(Int.max), at: point(1, 1)) }
+        rejects("negative circuit") { _ = try game.paint(.buoy(Int.min), at: point(1, 1)) }
+        rejects("off-grid brush") { _ = try game.paint(.land, at: point(Int.min, Int.max)) }
+        try verifyDraft(game)
+    }
+
+    var resized = MistWorkshopDraft(size: .large)
+    _ = try resized.paint(.origin, at: point(10, 8))
+    _ = try resized.paint(.harbor, at: point(9, 8))
+    _ = try resized.paint(.gate(2), at: point(3, 3))
+    let large = resized.board
+    expect(resized.resize(.small) && resized.tile(at: point(3, 3)) == .gate(2), "resize preserves retained area")
+    try verifyDraft(resized)
+    expect(resized.undo() && resized.board == large, "shrink recovered in one undo")
+
+    var draft = MistWorkshopDraft()
+    expect(try draft.configure(title: "  潮桥手记  ", author: "  林舟  ", letter: "海上见。\r\n岸上见。", echoLimit: 2, turnLimit: 7),
+           "metadata and tide are one transaction")
+    expect(draft.title == "潮桥手记" && draft.author == "林舟" && draft.letter == "海上见。\n岸上见。", "normalized display text")
+    let prior = try draft.encodedDraft()
+    rejects("invalid grouped settings") { _ = try draft.configure(title: "不会保存", turnLimit: 49) }
+    rejects("empty title") { _ = try draft.configure(title: "  ") }
+    rejects("multiline author") { _ = try draft.configure(author: "甲\n乙") }
+    rejects("long letter") { _ = try draft.configure(letter: String(repeating: "信", count: 161)) }
+    rejects("invalid echo limit") { _ = try draft.configure(echoLimit: -1) }
+    expect(try prior == draft.encodedDraft(), "all invalid settings preserve entire edit history")
+
+    let rows = ["##a####", "##.####", "S*.AB*H", "##.####", "##b####"]
+    let tiles: [Character: MistTile] = ["#": .land, ".": .water, "a": .buoy(0), "b": .buoy(1),
+                                         "A": .gate(0), "B": .gate(1), "*": .stamp, "S": .origin, "H": .harbor]
+    for (y, row) in rows.enumerated() {
+        for (x, glyph) in row.enumerated() { _ = try draft.paint(tiles[glyph]!, at: point(x, y)) }
+    }
+    var current = MistVoyage(level: draft.trialLevel())
+    let strokes: [Character: MistCommand] = ["E": .move(.east), "N": .move(.north), "S": .move(.south),
+                                             ".": .move(.wait), "|": .record]
+    for letter in "EENN|EESS|EE.EEEE" {
+        if case .blocked(let why) = current.perform(strokes[letter]!) { expect(false, "two-echo test \(why)") }
+    }
+    expect(current.delivered && current.stamped.count == 2 && current.echoes.count == 2, "author proves full puzzle")
+    let chart = try draft.seal(proof: current.history)
+    expect(chart.level.id == -1 && chart.level.guide == current.history && chart.level.par == 15,
+           "sealed guide and target")
+    let goldenID = "747a4b384de9eeb52a75d2d4684f3bfac8d32056963a2b208899b007049fcb73"
+    let fixture = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+    let archivedEdition = try MistWorkshopChart.open(fixture)
+    expect(archivedEdition.fingerprint == goldenID && chart.fingerprint == goldenID,
+           "published v1 chart and canonical content identity remain stable")
+    let bytes = try chart.encoded()
+    expect(bytes.count < 1024, "compact shared chart")
+    let reopened = try MistWorkshopChart.open(bytes)
+    expect(reopened.fingerprint == chart.fingerprint && reopened.level.guide == chart.level.guide, "sealed import stable")
+    let pretty = try encoded(decodeObject(bytes))
+    expect(try MistWorkshopChart.open(pretty).fingerprint == chart.fingerprint, "identity insensitive to JSON layout")
+    expect(MistVoyage(level: reopened.level, replay: reopened.level.guide)?.delivered == true, "ordinary engine playback")
+    var replay = MistVoyage(level: reopened.level)
+    for _ in 0..<50 where !replay.delivered {
+        guard let command = replay.hint().command else { break }
+        _ = replay.perform(command)
+    }
+    expect(replay.delivered, "normal hints use proof")
+    var copy = MistWorkshopDraft(chart: reopened)
+    expect(!copy.canUndo && copy.rows == draft.rows, "independent remix")
+    _ = try copy.configure(title: "另一份信")
+    expect(chart.level.title == "潮桥手记" && copy.trialLevel().guide.isEmpty, "edit leaves sealed edition intact")
+    _ = try copy.paint(.land, at: point(2, 2))
+    rejects("stale proof") { _ = try copy.seal(proof: current.history) }
+    rejects("unsolved proof") { _ = try draft.seal(proof: [.move(.east)]) }
+    rejects("empty proof") { _ = try draft.seal(proof: []) }
+    rejects("draft in file opener") { _ = try MistWorkshopChart.open(draft.encodedDraft()) }
+    rejects("file in draft loader") { _ = try MistWorkshopDraft.restoreDraft(bytes) }
+
+    let document = try decodeObject(bytes)
+    let board = document["board"] as! [String: Any]
+    func rejectsBoard(_ label: String, key: String, value: Any) {
+        var altered = document, map = board
+        map[key] = value
+        altered["board"] = map
+        rejects(label) { _ = try MistWorkshopChart.open(encoded(altered)) }
+    }
+    let badRows = [
+        [String](), [""], ["......."], Array(repeating: "X......", count: 5),
+        Array(repeating: ".......", count: 5), ["SS....H", ".......", ".......", ".......", "......."],
+        ["S....HH", ".......", ".......", ".......", "......."], ["S***..H", ".......", ".......", ".......", "......."],
+        ["S....H.", ".......", ".短行.", ".......", "......."], ["S....H.", "......", ".......", ".......", "......."]
+    ]
+    for (i, map) in badRows.enumerated() { rejectsBoard("bad rows \(i)", key: "rows", value: map) }
+    for tide in [-1, 0, 4, 49, Int.max] { rejectsBoard("invalid tide", key: "turnLimit", value: tide) }
+    for limit in [-1, 3, Int.max] { rejectsBoard("invalid echoes", key: "echoLimit", value: limit) }
+    rejectsBoard("invalid title", key: "title", value: "含\u{0000}符号")
+    rejectsBoard("unbounded by grapheme alone", key: "author", value: "A" + String(repeating: "\u{0301}", count: 2048))
+    for proof in [[String](), [""], ["EENN", ""], ["EENN", "EESS", "", "E"], ["EENQ"], ["E", "E", "E", "E"],
+                  ["EEEEEEEE"], ["EENN", "EESS", "EEEEEE"], ["EENN", "EESS", "EE.EEE"], ["EENN", "EESS", "EE.EEEE."]] {
+        var altered = document
+        altered["proof"] = proof
+        rejects("invalid proof \(proof)") { _ = try MistWorkshopChart.open(encoded(altered)) }
+    }
+    rejects("unknown version even with unknown layout") {
+        _ = try MistWorkshopChart.open(encoded(["format": "mistpost-chart", "version": 27]))
+    }
+    rejects("oversized file") { _ = try MistWorkshopChart.open(Data(repeating: 0, count: MistWorkshopChart.maximumFileBytes + 1)) }
+    rejects("oversized draft") {
+        _ = try MistWorkshopDraft.restoreDraft(Data(repeating: 0, count: MistWorkshopDraft.maximumDraftBytes + 1))
+    }
+    rejects("incomplete UTF-8 JSON") { _ = try MistWorkshopChart.open(Data([0xff, 0x7b])) }
+    rejects("missing wire format") { _ = try MistWorkshopChart.open(encoded(["board": board])) }
+    var archived = try decodeObject(draft.encodedDraft())
+    archived["undo"] = Array(repeating: board, count: 33)
+    let bounded = try MistWorkshopDraft.restoreDraft(encoded(archived))
+    expect(bounded.board == draft.board && bounded.undoBoards.count == 32, "restore bounds oversized history")
+    var bad = board
+    bad["rows"] = ["SH"]
+    archived["undo"] = [bad]
+    let rescued = try MistWorkshopDraft.restoreDraft(encoded(archived))
+    expect(rescued.board == draft.board && !rescued.canUndo, "rescue current sheet when old state is invalid")
+    archived["undo"] = "unreadable"
+    let rescuedFields = try MistWorkshopDraft.restoreDraft(encoded(archived))
+    expect(rescuedFields.board == draft.board && !rescuedFields.canUndo, "rescue readable board from unreadable undo field")
+    archived["undo"] = [bad, board]
+    let validSuffix = try MistWorkshopDraft.restoreDraft(encoded(archived))
+    expect(validSuffix.undoBoards.count == 1, "retain safe contiguous undo suffix")
+    archived["board"] = bad
+    rejects("invalid current sheet") { _ = try MistWorkshopDraft.restoreDraft(encoded(archived)) }
+
+    var limits = MistWorkshopDraft()
+    for number in 1...42 { _ = try limits.configure(title: "草图 \(number)") }
+    var restored = try MistWorkshopDraft.restoreDraft(limits.encodedDraft())
+    var undos = 0
+    while restored.undo() { undos += 1 }
+    expect(undos == 32 && restored.title == "草图 10", "persisted limit retains most recent 32 transactions")
+    print("Sealed two-echo/two-stamp fixture · \(bytes.count) bytes · \(chart.fingerprint)")
+}
+
+struct EditRandom {
+    var state: UInt64 = 0x54494445
+    mutating func int(_ bound: Int) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Int((state >> 23) % UInt64(bound))
+    }
+}
+
+func editChecks() throws {
+    var random = EditRandom(), draft = MistWorkshopDraft()
+    let brushes: [MistTile] = [.land, .water, .water, .origin, .harbor, .buoy(0), .gate(0),
+                               .buoy(1), .gate(1), .buoy(2), .gate(2), .stamp]
+    var sealed = 0
+    for i in 0..<5000 {
+        let prior = draft
+        var changed = false
+        do {
+            switch random.int(14) {
+            case 0: changed = draft.resize(MistWorkshopSize.allCases[random.int(3)])
+            case 1:
+                changed = try draft.configure(echoLimit: random.int(3), turnLimit: 5 + random.int(44))
+            case 2:
+                _ = draft.undo()
+                continue
+            default:
+                let cell = point(random.int(draft.size.width), random.int(draft.size.height))
+                changed = try draft.paint(brushes[random.int(brushes.count)], at: cell)
+            }
+        } catch is MistWorkshopError {
+            expect(prior.board == draft.board && prior.undoBoards == draft.undoBoards, "rejected random edit is atomic")
+            continue
+        }
+        var shadow = draft
+        if changed {
+            expect(shadow.undo() && shadow.board == prior.board, "single-step random undo")
+        } else {
+            expect(prior.board == draft.board && prior.undoBoards == draft.undoBoards, "no-op edit ignored")
+        }
+        if i % 19 == 0 {
+            try verifyDraft(draft)
+            let play = MistVoyage(level: draft.trialLevel())
+            if let moves = play.routeToDelivery() {
+                let chart = try draft.seal(proof: moves.map(MistCommand.move))
+                let loaded = try MistWorkshopChart.open(chart.encoded())
+                expect(loaded.fingerprint == chart.fingerprint, "random chart + proof round trip")
+                sealed += 1
+            }
+        }
+    }
+    expect(sealed > 0, "random playable draft sample")
+    print("5,000 mixed edits · \(sealed) additional playable files")
+}
+
+func terrainStrokes() throws {
+    var canvas = MistWorkshopDraft()
+    let blank = canvas.board
+    expect(canvas.beginTerrainStroke(.water), "water brush starts a gesture")
+    expect(!canvas.extendTerrainStroke(to: point(1, 0)), "same tile starts without undo")
+    expect(!canvas.extendTerrainStroke(to: point(0, 2)), "port-only stroke ignored")
+    canvas.endTerrainStroke()
+    expect(!canvas.canUndo && canvas.board == blank, "empty stroke kept history")
+    expect(!canvas.beginTerrainStroke(.stamp), "markers keep discrete semantics")
+    expect(canvas.beginTerrainStroke(.land), "land brush starts a gesture")
+    _ = canvas.extendTerrainStroke(to: point(0, 2))
+    _ = canvas.extendTerrainStroke(to: point(6, 2))
+    expect(canvas.rows[2] == "S#####H" && canvas.undoBoards == [blank], "protected endpoint ports")
+    let painting = try MistWorkshopDraft.restoreDraft(canvas.encodedDraft())
+    expect(!painting.isDrawingTerrain && painting.board == canvas.board && painting.undoBoards == [blank],
+           "mid-stroke autosave stays independently undoable")
+    expect(canvas.undo() && canvas.board == blank && !canvas.isDrawingTerrain, "undo interrupts held gesture")
+
+    let diagonal = [point(1,0),point(2,0),point(2,1),point(3,1),point(3,2),point(4,2),point(4,3)]
+    for reverse in [false, true] {
+        _ = canvas.beginTerrainStroke(.land)
+        _ = canvas.extendTerrainStroke(to: reverse ? diagonal.last! : diagonal.first!)
+        _ = canvas.extendTerrainStroke(to: reverse ? diagonal.first! : diagonal.last!)
+        canvas.endTerrainStroke()
+        expect(diagonal.allSatisfy { canvas.tile(at:$0) == .land } &&
+               canvas.rows.joined().filter { $0 == "#" }.count == diagonal.count,
+               "diagonal stays edge-connected in both directions")
+        expect(canvas.undo() && canvas.board == blank && !canvas.canUndo, "diagonal has one undo")
+    }
+    _ = canvas.beginTerrainStroke(.land)
+    _ = canvas.extendTerrainStroke(to: point(0,0))
+    _ = canvas.extendTerrainStroke(to: nil)
+    _ = canvas.extendTerrainStroke(to: point(6,4))
+    canvas.endTerrainStroke()
+    expect(canvas.rows.joined().filter { $0 == "#" }.count == 2, "re-entry does not bridge outside the canvas")
+    expect(canvas.undo() && canvas.board == blank, "off-canvas segments share one gesture")
+}
+
+do {
+    try fileCases()
+    try terrainStrokes()
+    try editChecks()
+} catch {
+    expect(false, "unexpected error \(error.localizedDescription)")
+}
+print("\(checks) workshop checks, \(failures) failures")
+exit(failures == 0 ? 0 : 1)

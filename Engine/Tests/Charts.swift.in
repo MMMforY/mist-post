@@ -1,0 +1,101 @@
+import Foundation
+
+func chartSignature(_ level: MistLevel) -> String {
+    var result = "\(level.width)x\(level.height)/\(level.turnLimit)/\(level.par)/"
+    for y in 0..<level.height {
+        for x in 0..<level.width {
+            switch level.tile(at: MistPoint(x: x, y: y)) {
+            case .land: result += "#"
+            case .water: result += "."
+            case .origin: result += "S"
+            case .harbor: result += "H"
+            case .stamp: result += "*"
+            case .buoy(let n): result.append(Array("abc")[n])
+            case .gate(let n): result.append(Array("ABC")[n])
+            }
+        }
+        result += "/"
+    }
+    return result
+}
+
+func checkChallenges(count: Int) {
+    var random = GameRandom(seed: 0x4d415053)
+    var motifs: Set<String> = []
+    var fallback: [String: Int] = [:]
+    var shapeHashes: Set<UInt64> = []
+    var generationMs: [Double] = []
+    var minPar = Int.max, maxPar = 0
+    for index in 0..<count {
+        let seed: UInt64 = index < count / 2 ? UInt64(index) : UInt64(random.choose(1 << 30))
+        let time = DispatchTime.now().uptimeNanoseconds
+        let chart = MistChallenge.make(seed: seed)
+        generationMs.append(Double(DispatchTime.now().uptimeNanoseconds - time) / 1e6)
+        let level = chart.level
+        motifs.insert(chart.motif)
+        if chart.usedFallback {
+            fallback[chart.motif, default: 0] += 1
+            if fallback[chart.motif, default: 0] == 1 { print("first fallback \(chart.motif) seed \(seed)") }
+        }
+        expect(level.id == 0 && level.width <= 13 && level.height <= 13, "chart dimensions")
+        let proof = MistVoyage(level: level, replay: level.guide)
+        expect(proof?.delivered == true && proof?.totalBeats == level.par, "\(chart.code) valid guide")
+        minPar = min(minPar, level.par)
+        maxPar = max(maxPar, level.par)
+        let signature = chartSignature(level)
+        var hash: UInt64 = 14695981039346656037
+        for byte in signature.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
+        shapeHashes.insert(hash)
+
+        if index < 128 || index % 131 == 0 {
+            let opened = MistChallenge.open(code: chart.code.lowercased().replacingOccurrences(of: "-", with: " "))
+            expect(opened?.code == chart.code && opened.map { chartSignature($0.level) } == signature
+                   && opened?.level.guide == level.guide, "\(chart.code) stable return from printed code")
+            expect(MistVoyage(level: level).routeToDelivery() == nil, "\(chart.code) echo is essential")
+            expect((oneEchoDelivery(level) != nil) == (level.echoLimit == 1), "\(chart.code) number of echoes")
+            checkHints(from: MistVoyage(level: level), report: chart.code)
+        }
+    }
+    expect(fallback.isEmpty, "zero chart fallbacks, got \(fallback)")
+    if count >= 16 { expect(motifs.count == 8, "8 construction motifs") }
+    expect(MistChallenge.open(code: "M2-000-000-0") == nil, "unknown chart version")
+    expect(MistChallenge.open(code: "M1-ABC-?EF-A") == nil, "unknown chart symbol")
+    expect(MistChallenge.open(code: String(repeating: "a", count: 1000)) == nil, "oversized chart code")
+    let check = MistChallenge.make(seed: 0x123456)
+    let raw = Array(check.code.filter { $0 != "-" })
+    let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    for index in 2...8 {
+        for char in alphabet where char != raw[index] {
+            var flipped = raw
+            flipped[index] = char
+            expect(MistChallenge.open(code: String(flipped)) == nil, "single-symbol checksum protection")
+        }
+    }
+    generationMs.sort()
+    let p95 = generationMs[min(count - 1, Int(Double(count) * 0.95))]
+    print("CHARTS \(count), motifs \(motifs.count), layouts+timings \(shapeHashes.count), fallback \(fallback.values.reduce(0,+)), par \(minPar)–\(maxPar), generation p95 \(String(format: "%.3f",p95)) ms")
+}
+
+
+func checkGoldenCharts() {
+    // These M1 vectors are part of the persisted-code compatibility contract.
+    // A change to chart construction or route semantics needs a new code version.
+    let vectors: [(String, UInt64)] = [
+        ("M1-000-000-X", 0xe3436a7aa90a7ca0),
+        ("M1-000-001-R", 0x545768057c85710c),
+        ("M1-000-002-Q", 0x229a327755c8a990),
+        ("M1-000-003-J", 0x5942e033efd67683),
+        ("M1-000-004-9", 0xea7ca05ef095dd1e),
+        ("M1-000-005-C", 0x7924d1b767375a9a),
+        ("M1-000-006-3", 0x1cad9b473805266f),
+        ("M1-000-007-6", 0x17c883a1ba64da66)
+    ]
+    for (index, vector) in vectors.enumerated() {
+        let (code, digest) = vector
+        let built = MistChallenge.make(seed: UInt64(index))
+        expect(built.code == code && versionFingerprint(built.level) == digest,
+               "preserve M1 map and route for \(code)")
+        expect(MistChallenge.open(code: code).map { versionFingerprint($0.level) } == digest,
+               "read archived M1 code \(code)")
+    }
+}

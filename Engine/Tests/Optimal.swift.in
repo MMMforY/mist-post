@@ -1,0 +1,199 @@
+import Foundation
+
+// An exact offline score audit. All voyages are advanced on the same beat.
+// Recording an echo at time t freezes its tile and stops charging it beats.
+// An actor may enter a gate only when an earlier actor occupies its buoy.
+private struct SeaExit {
+    let cell: Int
+    let action: Int
+}
+
+private struct ScoreNode {
+    let key: Int
+    var cost: Int
+    var parent: Int
+    var actions: Int
+}
+
+private struct AuditSea {
+    let cells: [MistPoint]
+    let start: Int
+    let end: Int
+    let gates: [Int]
+    let bells: [Int]
+    let stamp: [Int]
+    let maskCount: Int
+    let exits: [[SeaExit]]
+    let remaining: [[Int]]
+
+    init(_ level: MistLevel) {
+        var cells: [MistPoint] = []
+        var ids: [MistPoint: Int] = [:]
+        for y in 0..<level.height {
+            for x in 0..<level.width {
+                let p = MistPoint(x: x, y: y)
+                if level.tile(at: p) != .land {
+                    ids[p] = cells.count
+                    cells.append(p)
+                }
+            }
+        }
+        var gates = Array(repeating: -1, count: cells.count)
+        var bells = gates
+        var stamp = Array(repeating: 0, count: cells.count)
+        var stampCells: [Int] = []
+        for (index, point) in cells.enumerated() {
+            switch level.tile(at: point) {
+            case .gate(let id): gates[index] = id
+            case .buoy(let id): bells[index] = id
+            case .stamp:
+                stamp[index] = 1 << stampCells.count
+                stampCells.append(index)
+            default: break
+            }
+        }
+        let exits = cells.map { cell in
+            MistMove.allCases.enumerated().compactMap { action, move in
+                ids[cell.moved(move)].map { SeaExit(cell: $0, action: action) }
+            }
+        }
+        let end = ids[level.harbor]!
+        let maskCount = 1 << stampCells.count
+        // Shortest distance with all gates held open is an admissible lower bound.
+        var remaining = Array(repeating: Array(repeating: Int.max / 4, count: cells.count), count: maskCount)
+        var queue = [(maskCount - 1, end)]
+        remaining[maskCount - 1][end] = 0
+        var head = 0
+        while head < queue.count {
+            let (mask, cell) = queue[head]
+            let nextDistance = remaining[mask][cell] + 1
+            head += 1
+            for edge in exits[cell] {
+                guard edge.cell != end else { continue }
+                for oldMask in [mask, mask & ~stamp[cell]] where oldMask | stamp[cell] == mask {
+                    guard oldMask | stamp[edge.cell] == oldMask else { continue }
+                    if remaining[oldMask][edge.cell] > nextDistance {
+                        remaining[oldMask][edge.cell] = nextDistance
+                        queue.append((oldMask, edge.cell))
+                    }
+                }
+            }
+        }
+        self.cells = cells
+        self.start = ids[level.origin]!
+        self.end = end
+        self.gates = gates
+        self.bells = bells
+        self.stamp = stamp
+        self.maskCount = maskCount
+        self.exits = exits
+        self.remaining = remaining
+    }
+}
+
+func auditOptimal(_ level: MistLevel) -> (score: Int, explored: Int, routes: [[MistMove]]?) {
+    let sea = AuditSea(level)
+    let echoCount = level.echoLimit
+    let n = sea.cells.count
+    let n0 = echoCount > 0 ? n : 1
+    let n1 = echoCount > 1 ? n : 1
+    let count = n * n0 * n1 * sea.maskCount * (1 << echoCount)
+    let freeze = MistMove.allCases.count
+    let unused = SeaExit(cell: sea.start, action: freeze)
+    var best = level.par
+    var witness: [[MistMove]]?
+    var explored = 0
+    var slots = [Int32](repeating: -1, count: count)
+
+    func encode(_ live: Int, _ first: Int, _ second: Int, _ mask: Int, _ parked: Int) -> Int {
+        let p0 = echoCount > 0 ? first : 0
+        let p1 = echoCount > 1 ? second : 0
+        return live + n * (p0 + n0 * (p1 + n1 * (mask + sea.maskCount * parked)))
+    }
+    let root = ScoreNode(key: encode(sea.start, sea.start, sea.start, 0, 0),
+                         cost: 0, parent: -1, actions: 0)
+    var layers = [[root]]
+    for beat in 1...level.turnLimit {
+        let previous = layers[beat - 1]
+        var next: [ScoreNode] = []
+        for (slot, state) in previous.enumerated() {
+            var key = state.key
+            let live = key % n
+            key /= n
+            let first = echoCount > 0 ? key % n0 : sea.start
+            key /= n0
+            let second = echoCount > 1 ? key % n1 : sea.start
+            key /= n1
+            let marked = key % sea.maskCount
+            let parked = key / sea.maskCount
+            if state.cost + sea.remaining[marked][live] >= best { continue }
+            explored += 1
+            func options(_ cell: Int, _ actor: Int) -> [SeaExit] {
+                if actor >= echoCount { return [unused] }
+                let stop = SeaExit(cell: cell, action: freeze)
+                if parked & (1 << actor) != 0 { return [stop] }
+                if beat > 1 { return sea.exits[cell] + [stop] }
+                return sea.exits[cell]
+            }
+            for a in options(first, 0) {
+                if a.action != freeze, (sea.gates[a.cell] >= 0 || a.cell == sea.end) { continue }
+                let bellA = echoCount > 0 ? sea.bells[a.cell] : -1
+                for b in options(second, 1) {
+                    let lockB = sea.gates[b.cell]
+                    if b.action != freeze, (b.cell == sea.end || (lockB >= 0 && lockB != bellA)) { continue }
+                    let bellB = echoCount > 1 ? sea.bells[b.cell] : -1
+                    let cost = state.cost + 1 + (a.action == freeze ? 0 : 1) + (b.action == freeze ? 0 : 1)
+                    if cost >= best { continue }
+                    var nextParked = parked
+                    if echoCount > 0, a.action == freeze { nextParked |= 1 }
+                    if echoCount > 1, b.action == freeze { nextParked |= 2 }
+                    for c in sea.exits[live] {
+                        let lock = sea.gates[c.cell]
+                        if lock >= 0 && lock != bellA && lock != bellB { continue }
+                        let nextMarks = marked | sea.stamp[c.cell]
+                        let remaining = sea.remaining[nextMarks][c.cell]
+                        if beat + remaining > level.turnLimit || cost + remaining >= best { continue }
+                        let moves = (a.action << 6) | (b.action << 3) | c.action
+                        if c.cell == sea.end {
+                            guard nextMarks == sea.maskCount - 1 else { continue }
+                            best = cost
+                            var actionStream = [moves]
+                            var index = slot
+                            if beat > 1 {
+                                for time in stride(from: beat - 1, through: 1, by: -1) {
+                                    let ancestor = layers[time][index]
+                                    actionStream.append(ancestor.actions)
+                                    index = ancestor.parent
+                                }
+                            }
+                            var routes = Array(repeating: [MistMove](), count: echoCount + 1)
+                            for packed in actionStream.reversed() {
+                                let firstMove = (packed >> 6) & 7
+                                let secondMove = (packed >> 3) & 7
+                                if echoCount > 0, firstMove != freeze { routes[0].append(MistMove.allCases[firstMove]) }
+                                if echoCount > 1, secondMove != freeze { routes[1].append(MistMove.allCases[secondMove]) }
+                                routes[echoCount].append(MistMove.allCases[packed & 7])
+                            }
+                            witness = routes
+                        } else {
+                            let target = encode(c.cell, a.cell, b.cell, nextMarks, nextParked)
+                            let existing = Int(slots[target])
+                            if existing < 0 {
+                                slots[target] = Int32(next.count)
+                                next.append(ScoreNode(key: target, cost: cost, parent: slot, actions: moves))
+                            } else if cost < next[existing].cost {
+                                next[existing].cost = cost
+                                next[existing].parent = slot
+                                next[existing].actions = moves
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for state in next { slots[state.key] = -1 }
+        if next.isEmpty { break }
+        layers.append(next)
+    }
+    return (best, explored, witness)
+}

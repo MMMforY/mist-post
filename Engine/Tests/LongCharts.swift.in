@@ -1,0 +1,174 @@
+import Foundation
+
+private struct SavedChart: Codable {
+    let code: String
+    let history: [MistCommand]
+}
+
+func versionFingerprint(_ level: MistLevel) -> UInt64 {
+    var value: UInt64 = 14695981039346656037
+    func feed(_ byte: UInt8) { value = (value ^ UInt64(byte)) &* 1099511628211 }
+    for byte in chartSignature(level).utf8 { feed(byte) }
+    for command in level.guide {
+        switch command {
+        case .record: feed(5)
+        case .move(let move): feed(UInt8(MistMove.allCases.firstIndex(of: move)!))
+        }
+    }
+    return value
+}
+
+private func divergentVoyage(_ level: MistLevel, random: inout GameRandom) -> MistVoyage {
+    let starts = [0] + level.guide.indices.filter { level.guide[$0] == .record }.map { $0 + 1 }
+    let phase = random.choose(starts.count)
+    let start = starts[phase]
+    let end = phase + 1 < starts.count ? starts[phase + 1] - 1 : level.guide.count
+    let index = start + random.choose(max(1, end - start))
+    var game = MistVoyage(level: level, replay: Array(level.guide.prefix(index)))!
+    let moves = MistMove.allCases
+    let offset = random.choose(moves.count)
+    for i in 0..<moves.count {
+        let move = moves[(offset + i) % moves.count]
+        guard MistCommand.move(move) != level.guide[index] else { continue }
+        if case .blocked = game.step(move) { continue }
+        return game
+    }
+    // A narrow gate can leave only one move legal. The start always permits
+    // a distinct sailing action or wait in every construction family.
+    game.restart()
+    for move in moves where MistCommand.move(move) != level.guide[0] {
+        if case .blocked = game.step(move) { continue }
+        return game
+    }
+    return game
+}
+
+func checkLongCharts(total: Int) {
+    var random = GameRandom(seed: 0x455854454e444544)
+    var perMotif: [String: Int] = [:]
+    var sampleLayouts: [String: Set<UInt64>] = [:]
+    var seenDivergentPhases: [String: Set<Int>] = [:]
+    var phaseCounts: [String: Int] = [:]
+    var baselineStats: [String: (min: Int, max: Int)] = [:]
+    var oneEchoProofs = 0
+    var optimalProofs = 0
+    var batchStart = DispatchTime.now().uptimeNanoseconds
+    let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    for index in 0..<total {
+        // An odd stride modulo 2^30 enumerates distinct codes. Every eight
+        // consecutive values cover all motifs, independent of machine and locale.
+        let seed = (UInt64(index) &* 0x1f123bb5 &+ 0x0c0ffee) & ((1 << 30) - 1)
+        let chart = MistChallenge.make(seed: seed)
+        let level = chart.level
+        expect(!chart.usedFallback, "long chart \(chart.code) used fallback")
+        expect(MistVoyage(level: level, replay: level.guide)?.delivered == true,
+               "long chart \(chart.code) guide replay")
+        perMotif[chart.motif, default: 0] += 1
+        phaseCounts[chart.motif] = level.echoLimit + 1
+        let bounds = baselineStats[chart.motif] ?? (min: level.par, max: level.par)
+        baselineStats[chart.motif] = (min(bounds.min, level.par), max(bounds.max, level.par))
+        // The sample fingerprint includes the full map, timing and proof moves.
+        // Storing at most 4096 per family bounds memory on larger manual sweeps.
+        if perMotif[chart.motif, default: 0] <= 4096 {
+            sampleLayouts[chart.motif, default: []].insert(versionFingerprint(level))
+        }
+
+        let original = divergentVoyage(level, random: &random)
+        expect(!level.guide.starts(with: original.history), "long chart \(chart.code) actually diverged")
+        seenDivergentPhases[chart.motif, default: []].insert(original.echoes.count)
+        let stored = SavedChart(code: chart.code, history: original.history)
+        let data = try! JSONEncoder().encode(stored)
+        let decoded = try! JSONDecoder().decode(SavedChart.self, from: data)
+        guard let reconstructed = MistChallenge.open(code: decoded.code),
+              let resumed = MistVoyage(level: reconstructed.level, replay: decoded.history) else {
+            expect(false, "long chart \(chart.code) draft failed to reload")
+            continue
+        }
+        expect(reconstructed.code == chart.code && versionFingerprint(reconstructed.level) == versionFingerprint(level),
+               "long chart \(chart.code) deterministic regeneration")
+        expect(identical(original, resumed), "long chart \(chart.code) restore live and echo traces")
+        // Each action runs from the same resumed moment, including invalid
+        // water routes, occupied slots and reversal of a record boundary.
+        for command in MistMove.allCases.map(MistCommand.move) + [.record] {
+            var left = original, right = resumed
+            let lhs = left.perform(command), rhs = right.perform(command)
+            expect(lhs == rhs && identical(left, right), "long chart \(chart.code) identical next action")
+        }
+        var left = original, right = resumed
+        let firstUndo = left.undo(), secondUndo = right.undo()
+        expect(firstUndo == secondUndo && identical(left, right), "long chart \(chart.code) undo after restore")
+
+        // Independent checks on a regular sample of every motif.
+        if index % 512 < 8 {
+            expect((oneEchoDelivery(level) != nil) == (level.echoLimit == 1),
+                   "long chart \(chart.code) minimum echo count")
+            oneEchoProofs += 1
+            var gates: [MistPoint] = []
+            var landmarks = level.stamps.union([level.harbor])
+            for y in 0..<level.height {
+                for x in 0..<level.width {
+                    let point = MistPoint(x: x, y: y)
+                    switch level.tile(at: point) {
+                    case .gate: gates.append(point)
+                    case .buoy: landmarks.insert(point)
+                    default: break
+                    }
+                }
+            }
+            for gate in gates {
+                expect(!landmarks.isSubset(of: connected(level, closing: [gate])),
+                       "long chart \(chart.code) essential gate at \(gate)")
+            }
+            let hint = resumed.hint()
+            let beforeSave = original.hint()
+            expect(hint.text == beforeSave.text && hint.command == beforeSave.command
+                   && hint.point == beforeSave.point && hint.undoCount == beforeSave.undoCount,
+                   "long chart \(chart.code) hint after restore")
+            checkHints(from: resumed, report: "restored \(chart.code)")
+            var corrupted = Array(chart.code.filter { $0 != "-" })
+            let symbol = 2 + random.choose(7)
+            let digit = alphabet.firstIndex(of: corrupted[symbol])!
+            corrupted[symbol] = alphabet[(digit + 1 + random.choose(31)) % 32]
+            expect(MistChallenge.open(code: String(corrupted)) == nil, "long chart \(chart.code) damaged code")
+        }
+
+        if index < 8 || (index >= total / 2 && index < total / 2 + 8) {
+            let optimum = auditOptimal(level)
+            expect(optimum.score <= level.par, "long chart \(chart.code) reference is achievable")
+            if let routes = optimum.routes {
+                var replay = MistVoyage(level: level)
+                for (i, route) in routes.enumerated() {
+                    if i != 0 { _ = replay.record() }
+                    for move in route { _ = replay.step(move) }
+                }
+                expect(replay.delivered && replay.totalBeats == optimum.score,
+                       "long chart \(chart.code) independently optimized witness")
+            }
+            optimalProofs += 1
+        }
+
+        if (index + 1).isMultiple(of: 32) {
+            // Yield approximately three fifths of the wall time to interactive work.
+            let active = Double(DispatchTime.now().uptimeNanoseconds - batchStart) / 1e9
+            Thread.sleep(forTimeInterval: min(active * 1.5, 0.4))
+            batchStart = DispatchTime.now().uptimeNanoseconds
+        }
+        if (index + 1).isMultiple(of: 8192) {
+            print("EXTENDED checkpoint \(index + 1)/\(total)")
+            fflush(stdout)
+        }
+    }
+    if total >= 512 {
+        expect(perMotif.count == 8, "extended all motifs")
+        for motif in perMotif.keys.sorted() {
+            let samples = perMotif[motif]!
+            let distinct = sampleLayouts[motif]?.count ?? 0
+            let bounded = min(samples, 4096)
+            expect(Double(distinct) >= 0.90 * Double(bounded), "\(motif) chart variety")
+            expect(seenDivergentPhases[motif]?.count == phaseCounts[motif], "\(motif) noncanonical saves in each voyage")
+            let span = baselineStats[motif]!
+            print("  \(motif) · \(samples) chart saves · \(distinct)/\(bounded) sample fingerprints · target \(span.min)–\(span.max)")
+        }
+    }
+    print("EXTENDED \(total) code+draft round trips, \(oneEchoProofs) independent echo-count proofs, \(optimalProofs) score audits")
+}

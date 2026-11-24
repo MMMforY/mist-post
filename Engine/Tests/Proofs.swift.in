@@ -1,0 +1,82 @@
+import Foundation
+
+// Independent, simultaneous-boat search for necessary echo count. The first boat
+// may sail any legal recording, then wait indefinitely. All schedules of one echo
+// are included because the first boat has no prior echo gates of its own.
+private struct PairState: Hashable {
+    let echo: MistPoint
+    let live: MistPoint
+    let stamps: Set<MistPoint>
+}
+
+func oneEchoDelivery(_ level: MistLevel, allowLiveWait: Bool = true) -> Int? {
+    var frontier = [PairState(echo: level.origin, live: level.origin, stamps: [])]
+    var visited = Set(frontier)
+    for beat in 1...level.turnLimit {
+        var next: [PairState] = []
+        for state in frontier {
+            for firstMove in MistMove.allCases {
+                let echo = state.echo.moved(firstMove)
+                let echoTile = level.tile(at: echo)
+                switch echoTile {
+                case .land, .harbor, .gate: continue
+                default: break
+                }
+                for secondMove in MistMove.allCases {
+                    if !allowLiveWait, secondMove == .wait { continue }
+                    let live = state.live.moved(secondMove)
+                    let tile = level.tile(at: live)
+                    switch tile {
+                    case .land: continue
+                    case .gate(let signal) where echoTile != .buoy(signal): continue
+                    case .harbor:
+                        if state.stamps == level.stamps { return beat }
+                        continue
+                    default: break
+                    }
+                    var stamps = state.stamps
+                    if tile == .stamp { stamps.insert(live) }
+                    let candidate = PairState(echo: echo, live: live, stamps: stamps)
+                    if visited.insert(candidate).inserted { next.append(candidate) }
+                }
+            }
+        }
+        if next.isEmpty { return nil }
+        frontier = next
+    }
+    return nil
+}
+
+// A relaxation of the actual game: every gate is permanently open except the
+// tested closures. Flood fill is sufficient to certify unreachable landmarks.
+func connected(_ level: MistLevel, closing closed: Set<MistPoint>) -> Set<MistPoint> {
+    var seen: Set<MistPoint> = [level.origin]
+    var queue = [level.origin]
+    var head = 0
+    while head < queue.count {
+        let point = queue[head]
+        head += 1
+        for move in [MistMove.north, .east, .south, .west] {
+            let next = point.moved(move)
+            if level.tile(at: next) != .land, !closed.contains(next), seen.insert(next).inserted {
+                queue.append(next)
+            }
+        }
+    }
+    return seen
+}
+
+struct GameRandom {
+    private var state: UInt64
+
+    init(seed: UInt64) { state = seed }
+
+    mutating func choose(_ count: Int) -> Int {
+        // SplitMix64; the seed and integer arithmetic make regressions reproducible.
+        state &+= 0x9e3779b97f4a7c15
+        var word = state
+        word = (word ^ (word >> 30)) &* 0xbf58476d1ce4e5b9
+        word = (word ^ (word >> 27)) &* 0x94d049bb133111eb
+        return Int((word ^ (word >> 31)) % UInt64(count))
+    }
+}
